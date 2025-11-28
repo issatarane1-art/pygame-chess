@@ -1,0 +1,455 @@
+import pygame
+import sys
+from pygame.locals import *
+from copy import deepcopy
+
+# ----------------------------
+# تنظیمات پایه
+# ----------------------------
+pygame.init()
+FPS = 60
+CLOCK = pygame.time.Clock()
+WIDTH, HEIGHT = 800, 800
+SCREEN = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("شطرنج — زیبا و معلوم")
+
+# رنگ‌ها
+BG_COLOR = (30, 30, 40)
+LIGHT_SQ = (240, 217, 181)
+DARK_SQ = (181, 136, 99)
+HIGHLIGHT = (120, 200, 255, 140)
+SELECT_COLOR = (255, 215, 0, 160)
+CHECK_COLOR = (255, 100, 100, 180)
+TEXT_COLOR = (240, 240, 240)
+
+# ابعاد
+BOARD_MARGIN = 40
+BOARD_SIZE = min(WIDTH, HEIGHT) - 2 * BOARD_MARGIN
+SQUARE = BOARD_SIZE // 8
+BOARD_ORIGIN = (BOARD_MARGIN, BOARD_MARGIN)
+
+# فونت‌ها
+try:
+    UNICODE_FONT = pygame.font.Font(pygame.font.match_font('dejavusans'), SQUARE - 10)
+except Exception:
+    UNICODE_FONT = pygame.font.SysFont('dejavusans', SQUARE - 10)
+UI_FONT = pygame.font.SysFont('Arial', 20)
+
+# کاراکترهای یونیکد برای مهره‌ها
+PIECE_UNICODE = {
+    'K': '\u2654', 'Q': '\u2655', 'R': '\u2656', 'B': '\u2657', 'N': '\u2658', 'P': '\u2659',
+    'k': '\u265A', 'q': '\u265B', 'r': '\u265C', 'b': '\u265D', 'n': '\u265E', 'p': '\u265F'
+}
+
+# ----------------------------
+# مدل بازی (Game State & Moves)
+# ----------------------------
+class GameState:
+    def __init__(self):
+        # برد به صورت ماتریس 8x8؛ هر خانه None یا رشته دو حرف: 'wP','bK'...
+        self.board = [
+            ['bR','bN','bB','bQ','bK','bB','bN','bR'],
+            ['bP','bP','bP','bP','bP','bP','bP','bP'],
+            [None]*8,
+            [None]*8,
+            [None]*8,
+            [None]*8,
+            ['wP','wP','wP','wP','wP','wP','wP','wP'],
+            ['wR','wN','wB','wQ','wK','wB','wN','wR'],
+        ]
+        self.turn = 'w'  # 'w' یا 'b'
+        self.selected = None  # (r,c) انتخاب‌شده توسط کاربر
+        self.valid_moves_cache = None
+        self.move_history = []
+        # برای تبدیل پیاده
+        self.promotion = None  # ((r,c), color) هنگام رسیدن پیاده به خط آخر
+        # برای ساده‌سازی: کاستل و ان‌پسان‌پاس را در این نسخه نمی‌آوریم (برای کوتاهی و ثبات)
+    
+    def in_bounds(self, r, c):
+        return 0 <= r < 8 and 0 <= c < 8
+
+    def piece_at(self, r, c):
+        return self.board[r][c]
+
+    def is_enemy(self, r, c, color):
+        p = self.piece_at(r,c)
+        return p and p[0] != color
+
+    def is_empty(self, r, c):
+        return self.piece_at(r,c) is None
+
+    def clone(self):
+        return deepcopy(self)
+
+    def find_king(self, color):
+        for r in range(8):
+            for c in range(8):
+                p = self.piece_at(r,c)
+                if p and p[0] == color and p[1] == 'K':
+                    return (r,c)
+        return None
+
+    # تولید حرکات پایه (بدون فیلتر کیش)
+    def generate_raw_moves(self, r, c):
+        p = self.piece_at(r,c)
+        if not p: return []
+        color, kind = p[0], p[1]
+        moves = []
+        directions = []
+        if kind == 'P':
+            dir_f = -1 if color == 'w' else 1
+            start_row = 6 if color == 'w' else 1
+            # یک خانه جلو
+            nr, nc = r + dir_f, c
+            if self.in_bounds(nr,nc) and self.is_empty(nr,nc):
+                moves.append((nr,nc))
+                # دو خانه از شروع
+                nr2 = r + 2*dir_f
+                if r == start_row and self.in_bounds(nr2,nc) and self.is_empty(nr2,nc):
+                    moves.append((nr2,nc))
+            # ضرب
+            for dc in (-1,1):
+                nr, nc = r + dir_f, c + dc
+                if self.in_bounds(nr,nc) and self.is_enemy(nr,nc,color):
+                    moves.append((nr,nc))
+            # (ان‌پسان‌پاس و تبدیل پیاده جدا)
+        elif kind == 'N':
+            for dr,dc in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]:
+                nr, nc = r+dr, c+dc
+                if not self.in_bounds(nr,nc): continue
+                if self.is_empty(nr,nc) or self.is_enemy(nr,nc,color):
+                    moves.append((nr,nc))
+        elif kind == 'B':
+            directions = [(-1,-1),(-1,1),(1,-1),(1,1)]
+        elif kind == 'R':
+            directions = [(-1,0),(1,0),(0,-1),(0,1)]
+        elif kind == 'Q':
+            directions = [(-1,-1),(-1,1),(1,-1),(1,1),(-1,0),(1,0),(0,-1),(0,1)]
+        elif kind == 'K':
+            for dr in (-1,0,1):
+                for dc in (-1,0,1):
+                    if dr==0 and dc==0: continue
+                    nr, nc = r+dr, c+dc
+                    if not self.in_bounds(nr,nc): continue
+                    if self.is_empty(nr,nc) or self.is_enemy(nr,nc,color):
+                        moves.append((nr,nc))
+            # کاستل حذف شد برای سادگی
+        # برای اسلایدینگ پیاده‌سازی
+        if directions:
+            for dr,dc in directions:
+                nr, nc = r+dr, c+dc
+                while self.in_bounds(nr,nc):
+                    if self.is_empty(nr,nc):
+                        moves.append((nr,nc))
+                    elif self.is_enemy(nr,nc,color):
+                        moves.append((nr,nc))
+                        break
+                    else:
+                        break
+                    nr += dr; nc += dc
+        return moves
+
+    # آیا حرکت (r1,c1)->(r2,c2) قانونی است (شاه را در کیش قرار ندهد)
+    def is_move_legal(self, r1,c1,r2,c2):
+        # حرکت باید متعلق به نوبت باشد
+        piece = self.piece_at(r1,c1)
+        if not piece or piece[0] != self.turn: return False
+        raw = self.generate_raw_moves(r1,c1)
+        if (r2,c2) not in raw: 
+            return False
+        # شبیه‌سازی حرکت و بررسی کیش
+        gs2 = self.clone()
+        gs2.make_move_no_validate(r1,c1,r2,c2)
+        king_pos = gs2.find_king(self.turn)
+        if not king_pos:
+            return False
+        if gs2.is_square_attacked(king_pos[0], king_pos[1], 'w' if self.turn=='b' else 'b'):
+            return False
+        return True
+
+    # بررسی اینکه یک خانه توسط رنگ attacker تهدید می‌شود
+    def is_square_attacked(self, r, c, attacker_color):
+        # برای هر مهره مهاجم بررسی می‌کنیم که می‌تواند به این خانه برود (بدون در نظر گرفتن اینکه شاه در کیش قرار می‌گیرد)
+        for rr in range(8):
+            for cc in range(8):
+                p = self.piece_at(rr,cc)
+                if p and p[0]==attacker_color:
+                    if (r,c) in self.generate_raw_moves(rr,cc):
+                        # برای پیاده باید جهت ضرب را بررسی کنیم: generate_raw_moves برای پیاده ضرب را اضافه کرده است، پس اوکی
+                        return True
+        return False
+
+    # اجرای حرکت بدون اعتبارسنجی (برای شبیه‌سازی)
+    def make_move_no_validate(self, r1,c1,r2,c2):
+        piece = self.board[r1][c1]
+        self.board[r1][c1] = None
+        # تبدیل پیاده
+        if piece and piece[1] == 'P':
+            if (piece[0]=='w' and r2==0) or (piece[0]=='b' and r2==7):
+                # تبدیل خودکار به وزیر (برای سادگی)؛ می‌تونی منو برای انتخاب بذاری
+                piece = piece[0] + 'Q'
+        self.board[r2][c2] = piece
+
+    # اجرای حرکت قانونی (بررسی و ثبت تاریخچه)
+    def make_move(self, r1,c1,r2,c2):
+        if not self.is_move_legal(r1,c1,r2,c2):
+            return False
+        piece = self.board[r1][c1]
+        captured = self.board[r2][c2]
+        # بردار کردن و قرار دادن
+        self.board[r1][c1] = None
+        # promotion
+        if piece and piece[1]=='P':
+            if (piece[0]=='w' and r2==0) or (piece[0]=='b' and r2==7):
+                # تبدیل به وزیر به صورت پیش‌فرض
+                piece = piece[0] + 'Q'
+        self.board[r2][c2] = piece
+        self.move_history.append(((r1,c1),(r2,c2),piece,captured))
+        # تغییر نوبت
+        self.turn = 'b' if self.turn == 'w' else 'w'
+        # پاک کردن انتخاب و کش‌ها
+        self.selected = None
+        self.valid_moves_cache = None
+        return True
+
+    # گرفتن همه حرکات قانونی برای خانه انتخاب‌شده
+    def legal_moves_from(self, r,c):
+        moves = []
+        raw = self.generate_raw_moves(r,c)
+        for (nr,nc) in raw:
+            if self.is_move_legal(r,c,nr,nc):
+                moves.append((nr,nc))
+        return moves
+
+    # آیا طرف فعلی در کیش است؟
+    def in_check(self, color):
+        king = self.find_king(color)
+        if not king: return False
+        return self.is_square_attacked(king[0], king[1], 'w' if color=='b' else 'b')
+
+    # آیا طرف فعلی مات شده؟
+    def is_checkmate(self, color):
+        # اگر در کیش نباشد، مات نیست
+        if not self.in_check(color): return False
+        # اگر هیچ حرکت قانونی نداشته باشد، مات است
+        for r in range(8):
+            for c in range(8):
+                p = self.piece_at(r,c)
+                if p and p[0]==color:
+                    if self.legal_moves_from(r,c):
+                        return False
+        return True
+
+# ----------------------------
+# رسم و رابط کاربری
+# ----------------------------
+def board_to_screen(r,c):
+    ox, oy = BOARD_ORIGIN
+    return ox + c * SQUARE, oy + r * SQUARE
+
+def screen_to_board(x,y):
+    ox, oy = BOARD_ORIGIN
+    if x < ox or y < oy: return None
+    bx = (x - ox) // SQUARE
+    by = (y - oy) // SQUARE
+    if 0 <= bx < 8 and 0 <= by < 8:
+        return (by, bx)
+    return None
+
+def draw_board(gs):
+    # پس‌زمینه
+    SCREEN.fill(BG_COLOR)
+    # تخته
+    ox, oy = BOARD_ORIGIN
+    # لایه‌دار برای سایه و زیبایی
+    pygame.draw.rect(SCREEN, (20,20,30), (ox-8, oy-8, BOARD_SIZE+16, BOARD_SIZE+16), border_radius=8)
+    pygame.draw.rect(SCREEN, (40,40,50), (ox, oy, BOARD_SIZE, BOARD_SIZE), border_radius=4)
+    # خانه‌ها
+    for r in range(8):
+        for c in range(8):
+            rect = pygame.Rect(ox + c*SQUARE, oy + r*SQUARE, SQUARE, SQUARE)
+            color = LIGHT_SQ if (r+c)%2==0 else DARK_SQ
+            pygame.draw.rect(SCREEN, color, rect)
+    # نشانگر کیش
+    if gs.in_check(gs.turn):
+        kpos = gs.find_king(gs.turn)
+        if kpos:
+            kr, kc = kpos
+            rect = pygame.Rect(ox + kc*SQUARE, oy + kr*SQUARE, SQUARE, SQUARE)
+            s = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+            s.fill(CHECK_COLOR)
+            SCREEN.blit(s, rect.topleft)
+    # خطوط و اعداد
+    # حروف ستون‌ها در پایین و شماره ردیف‌ها در چپ
+    for i in range(8):
+        # حروف
+        txt = UI_FONT.render(chr(ord('a')+i), True, TEXT_COLOR)
+        SCREEN.blit(txt, (ox + i*SQUARE + SQUARE//2 - txt.get_width()//2, oy + 8 + 8 + BOARD_SIZE))
+    for i in range(8):
+        txt = UI_FONT.render(str(8-i), True, TEXT_COLOR)
+        SCREEN.blit(txt, (8, oy + i*SQUARE + SQUARE//2 - txt.get_height()//2))
+
+def draw_pieces(gs, dragging):
+    ox, oy = BOARD_ORIGIN
+    for r in range(8):
+        for c in range(8):
+            p = gs.piece_at(r,c)
+            if p:
+                if dragging and dragging['from']==(r,c):
+                    continue
+                draw_piece_at(p, r, c)
+
+def draw_piece_at(piece, r, c, offset=(0,0), scale=1.0):
+    ox, oy = BOARD_ORIGIN
+    x = ox + c*SQUARE + SQUARE//2 + offset[0]
+    y = oy + r*SQUARE + SQUARE//2 + offset[1]
+    ch = PIECE_UNICODE[piece[1] if piece[0]=='w' else piece[1].lower()] if False else None
+    # استفاده از کاراکترهای یونیکد برای مهره‌ها
+    if piece:
+        char = PIECE_UNICODE[piece[1] if piece[0]=='w' else piece[1].lower()] if False else None
+        # برای خوانایی از یونیکد بر اساس حرف بزرگ/کوچک استفاده نکنیم؛ ساده‌تر: نگاشت دستی
+        # اما برای پشتیبانی واضح، استفاده می‌کنیم:
+        uni_map = {
+            'wK':'\u2654','wQ':'\u2655','wR':'\u2656','wB':'\u2657','wN':'\u2658','wP':'\u2659',
+            'bK':'\u265A','bQ':'\u265B','bR':'\u265C','bB':'\u265D','bN':'\u265E','bP':'\u265F',
+        }
+        ch = uni_map.get(piece, '?')
+        # پس‌زمینه دایره‌ای برای مهره
+        radius = int(SQUARE*0.42*scale)
+        circle_color = (245,245,245) if piece[0]=='w' else (30,30,30)
+        outline = (200,200,200) if piece[0]=='w' else (10,10,10)
+        pygame.draw.circle(SCREEN, circle_color, (x,y), radius)
+        pygame.draw.circle(SCREEN, outline, (x,y), radius, 2)
+        # متن یونیکد
+        txt = UNICODE_FONT.render(ch, True, (20,20,20) if piece[0]=='w' else (245,245,245))
+        txt_rect = txt.get_rect(center=(x,y))
+        SCREEN.blit(txt, txt_rect)
+
+def draw_highlights(gs, moves, selected):
+    ox, oy = BOARD_ORIGIN
+    s_move = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+    s_move.fill((0,0,0,0))
+    # نشان دادن خانه انتخاب‌شده
+    if selected:
+        r,c = selected
+        rect = pygame.Rect(ox + c*SQUARE, oy + r*SQUARE, SQUARE, SQUARE)
+        s = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+        s.fill(SELECT_COLOR)
+        SCREEN.blit(s, rect.topleft)
+    # نمایش حرکات قانونی
+    s_dot = pygame.Surface((SQUARE, SQUARE), pygame.SRCALPHA)
+    for (nr,nc) in moves:
+        cx = ox + nc*SQUARE + SQUARE//2
+        cy = oy + nr*SQUARE + SQUARE//2
+        rdot = SQUARE//8
+        pygame.draw.circle(SCREEN, HIGHLIGHT, (cx,cy), rdot)
+
+def draw_ui(gs):
+    # پنل سمت راست برای اطلاعات ساده
+    x = BOARD_MARGIN + BOARD_SIZE + 10
+    y = BOARD_MARGIN
+    # جعبه
+    pygame.draw.rect(SCREEN, (24,24,32), (x, y, WIDTH - x - BOARD_MARGIN, BOARD_SIZE), border_radius=6)
+    # نوبت
+    turn_txt = "نوبت سفید" if gs.turn=='w' else "نوبت سیاه"
+    txt = UI_FONT.render(turn_txt, True, TEXT_COLOR)
+    SCREEN.blit(txt, (x+12, y+12))
+    # وضعیت کیش/مات
+    if gs.in_check(gs.turn):
+        ch_txt = UI_FONT.render("کیش!", True, CHECK_COLOR[:3])
+        SCREEN.blit(ch_txt, (x+12, y+40))
+    if gs.is_checkmate(gs.turn):
+        m_txt = UI_FONT.render("مات شد!", True, (220,80,80))
+        SCREEN.blit(m_txt, (x+12, y+70))
+    # تاریخچه مختصر
+    hist = gs.move_history[-8:]
+    yy = y + 110
+    header = UI_FONT.render("تاریخچه حرکت‌ها:", True, TEXT_COLOR)
+    SCREEN.blit(header, (x+12, yy))
+    yy += 28
+    for i, mv in enumerate(reversed(hist)):
+        ((r1,c1),(r2,c2),p,captured) = mv
+        s = f"{8-r1}{chr(ord('a')+c1)} → {8-r2}{chr(ord('a')+c2)}"
+        t = UI_FONT.render(s, True, TEXT_COLOR)
+        SCREEN.blit(t, (x+12, yy))
+        yy += 22
+
+# ----------------------------
+# حلقه اصلی و منطق ورودی
+# ----------------------------
+def main():
+    gs = GameState()
+    dragging = None  # {'from':(r,c), 'offset':(x,y), 'piece': 'wP'}
+    running = True
+
+    while running:
+        CLOCK.tick(FPS)
+        mouse = pygame.mouse.get_pos()
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                running = False
+                break
+            if event.type == MOUSEBUTTONDOWN and event.button==1:
+                bpos = screen_to_board(*event.pos)
+                if bpos:
+                    r,c = bpos
+                    piece = gs.piece_at(r,c)
+                    if piece and piece[0]==gs.turn:
+                        gs.selected = (r,c)
+                        valid = gs.legal_moves_from(r,c)
+                        dragging = {'from':(r,c), 'offset': (event.pos[0] - (BOARD_ORIGIN[0]+c*SQUARE+SQUARE//2),
+                                                             event.pos[1] - (BOARD_ORIGIN[1]+r*SQUARE+SQUARE//2)),
+                                    'piece': piece,
+                                    'valid': valid}
+            if event.type == MOUSEBUTTONUP and event.button==1:
+                if dragging:
+                    bpos = screen_to_board(*event.pos)
+                    if bpos:
+                        r2,c2 = bpos
+                        r1,c1 = dragging['from']
+                        if gs.make_move(r1,c1,r2,c2):
+                            # موفق
+                            pass
+                        else:
+                            # ناموفق — برمی‌گردیم
+                            pass
+                    dragging = None
+                    gs.selected = None
+            if event.type == KEYDOWN:
+                if event.key == K_u:  # undo
+                    if gs.move_history:
+                        last = gs.move_history.pop()
+                        ((r1,c1),(r2,c2),piece,captured) = last
+                        gs.board[r1][c1] = piece
+                        gs.board[r2][c2] = captured
+                        gs.turn = 'b' if gs.turn=='w' else 'w'
+                if event.key == K_r:  # ریست
+                    gs = GameState()
+                    dragging = None
+
+        # رندر
+        draw_board(gs)
+        # هایلایت انتخاب و حرکات
+        valid = []
+        if gs.selected:
+            valid = gs.legal_moves_from(*gs.selected)
+        draw_highlights(gs, valid, gs.selected)
+        # مهره‌ها
+        draw_pieces(gs, dragging)
+        # مهره در حال کشیدن (انیمیشن ساده)
+        if dragging:
+            mx, my = mouse
+            offx = dragging['offset'][0]
+            offy = dragging['offset'][1]
+            draw_piece_at(dragging['piece'], dragging['from'][0], dragging['from'][1], offset=(mx-offx - (BOARD_ORIGIN[0]+dragging['from'][1]*SQUARE+SQUARE//2),
+                                                                                            my-offy - (BOARD_ORIGIN[1]+dragging['from'][0]*SQUARE+SQUARE//2)))
+        # UI سمت راست
+        draw_ui(gs)
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
